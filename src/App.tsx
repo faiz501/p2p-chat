@@ -7,6 +7,18 @@ function App() {
   const [greetMsg, setGreetMsg] = useState("");
   const [name, setName] = useState("");
 
+  const [room, update_room] = useState("");
+  const [s_msg, update_snd_msg] = useState("");
+  const [r_msg, update_rcv_msg] = useState("");
+
+  async function create_room() {
+    update_room("test")
+    update_room(await invoke("create_room", { room: room }));
+  }
+  async function send_msg() {
+    update_rcv_msg(await invoke("send_msg", { sMsg: s_msg }));
+  }
+
   async function greet() {
     // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
     setGreetMsg(await invoke("greet", { name }));
@@ -14,6 +26,30 @@ function App() {
 
   return (
     <main className="container">
+
+    <button
+        onClick={(e) => {
+          e.preventDefault();
+          create_room();
+          console.log("create room")
+        }}
+      >Create Room</button>
+    <p id="crt_rm">{room}</p>
+    <input type="text" id="join" placeholder="Join"></input>
+    <button
+      >Join Room</button>
+    <input type="text" id="snd_mdg"
+      onChange={(e) => update_snd_msg(e.currentTarget.value)}
+      placeholder="Send Message"></input>
+    <button
+        onClick={(e) => {
+          e.preventDefault();
+          send_msg();
+        }}
+      >Send Message</button>
+    <p id="rcv_mdg">{r_msg}</p>
+
+      
       <h1>Welcome to Tauri + React</h1>
 
       <div className="row">
