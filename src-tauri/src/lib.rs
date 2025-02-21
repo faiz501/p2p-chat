@@ -1,111 +1,214 @@
-// Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-mod iroh;
-mod messages;
+#![cfg_attr(
+    all(not(debug_assertions), target_os = "windows"),
+    windows_subsystem = "windows"
+)]
+
+// Assume that the dumbpipe module exists (or is available as a dependency)
+mod dumbpipe;
 
 use anyhow::Result;
-use messages::Chat;
+use std::str::FromStr;
 use std::sync::Arc;
 use tauri::Emitter;
-use tauri::Manager;
 use tokio::sync::Mutex;
 
-/// Application state holds the chat instance.
-struct AppState {
-    chat: Mutex<Option<Arc<Chat>>>,
+// Import dumbpipe and iroh types
+use dumbpipe::{NodeTicket, ALPN, HANDSHAKE};
+use iroh::{endpoint::Endpoint, SecretKey};
+// Use the OsRng type from the rand crate so that the trait bounds match.
+use rand::rngs::OsRng;
+
+/// Global state for the active chat session.
+/// (We allow only one session at a time in this simple prototype.)
+#[derive(Default)]
+struct ChatState(pub Arc<Mutex<Option<chat::ChatSession>>>);
+
+/// Tauri command to create a chat room (i.e. listen for an incoming connection)
+#[tauri::command]
+async fn create_chat_room(
+    app_handle: tauri::AppHandle,
+    chat_state: tauri::State<'_, ChatState>,
+) -> Result<String, String> {
+    match chat::create_chat_room(app_handle, chat_state).await {
+        Ok(ticket) => Ok(ticket.to_string()),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
-impl AppState {
-    fn new() -> Self {
-        AppState {
-            chat: Mutex::new(None),
+/// Tauri command to join an existing chat room given a NodeTicket string.
+#[tauri::command]
+async fn join_chat_room(
+    app_handle: tauri::AppHandle,
+    ticket: String,
+    chat_state: tauri::State<'_, ChatState>,
+) -> Result<(), String> {
+    chat::join_chat_room(app_handle, ticket, chat_state)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Tauri command to send a message on the active chat session.
+#[tauri::command]
+async fn send_message(
+    message: String,
+    chat_state: tauri::State<'_, ChatState>,
+) -> Result<(), String> {
+    chat::send_message(chat_state, message)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// The chat module implements the core connection logic using dumbpipe and iroh.
+mod chat {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A chat session holds the send half of the bidirectional stream.
+    pub struct ChatSession {
+        pub sender: Arc<Mutex<iroh::endpoint::SendStream>>,
+    }
+
+    /// Helper to get or create a secret key.
+    async fn get_or_create_secret() -> Result<SecretKey> {
+        if let Ok(secret) = std::env::var("IROH_SECRET") {
+            SecretKey::from_str(&secret).map_err(|e| e.into())
+        } else {
+            let key = SecretKey::generate(OsRng);
+            eprintln!("using secret key {}", key);
+            Ok(key)
         }
     }
-}
 
-/// Start a chat session.
-/// If a nodeid is provided, join that room; if not, create a new chat room.
-/// The command returns the current node id (which is our local node id when creating a new room,
-/// or the remote node id if joining an existing room).
-#[tauri::command]
-async fn start_chat(
-    app_handle: tauri::AppHandle,
-    nodeid: Option<String>,
-    state: tauri::State<'_, AppState>,
-) -> Result<String, String> {
-    // Create the chat instance (using the nodeid if provided)
-    let chat = Chat::new(nodeid).await.map_err(|e| e.to_string())?;
-    // Extract the node id as a string
-    let current_node_id = chat
-        .nodeid
-        .as_ref()
-        .expect("nodeid should be set")
-        .to_string();
-    let chat = Arc::new(chat);
-    {
-        let mut chat_lock = state.chat.lock().await;
-        *chat_lock = Some(chat.clone());
-    }
+    /// Create a chat room: bind a dumbpipe endpoint and wait for an incoming connection.
+    /// When a peer connects and sends the proper handshake, the sender half is saved
+    /// in the global chat state and incoming messages are emitted as Tauri events.
+    pub async fn create_chat_room(
+        app_handle: tauri::AppHandle,
+        chat_state: tauri::State<'_, super::ChatState>,
+    ) -> Result<NodeTicket> {
+        let secret_key = get_or_create_secret().await?;
+        let builder = Endpoint::builder()
+            .alpns(vec![ALPN.to_vec()])
+            .secret_key(secret_key);
+        // Bind to a random available port.
+        let endpoint = builder.bind().await?;
+        // Wait until the endpoint’s relay is ready.
+        endpoint.home_relay().initialized().await?;
+        let node_addr = endpoint.node_addr().await?;
+        let ticket = NodeTicket::new(node_addr.clone());
 
-    // Spawn an async task that continuously listens for incoming messages.
-    let app_handle_clone = app_handle.clone();
-    tokio::spawn(async move {
-        loop {
-            match chat.receive().await {
-                Ok(msg) => {
-                    // Emit the new message to the frontend (use event "new_message")
-                    if let Err(e) = app_handle_clone.emit("new_message", msg) {
-                        eprintln!("Error emitting new_message event: {:?}", e);
+        // Spawn a background task to accept a connection.
+        let app_handle_clone = app_handle.clone();
+        let chat_state_clone = chat_state.0.clone();
+        tokio::spawn(async move {
+            if let Some(connecting) = endpoint.accept().await {
+                if let Ok(connection) = connecting.await {
+                    if let Ok((mut send, mut recv)) = connection.accept_bi().await {
+                        // Read and verify the fixed handshake.
+                        let mut buf = [0u8; HANDSHAKE.len()];
+                        if let Ok(()) = recv.read_exact(&mut buf).await {
+                            if buf == HANDSHAKE {
+                                // Spawn a task to continuously read messages and emit them to the frontend.
+                                let app_handle_inner = app_handle_clone.clone();
+                                tokio::spawn(async move {
+                                    let mut buffer = vec![0u8; 1024];
+                                    loop {
+                                        match recv.read(&mut buffer).await {
+                                            Ok(Some(n)) if n == 0 => break, // connection closed
+                                            Ok(Some(n)) => {
+                                                let message = String::from_utf8_lossy(&buffer[..n])
+                                                    .to_string();
+                                                let _ =
+                                                    app_handle_inner.emit("new-message", message);
+                                            }
+                                            Ok(None) => break,
+                                            Err(_) => break,
+                                        }
+                                    }
+                                });
+                                // Save the send stream so that outgoing messages can be sent.
+                                let session = ChatSession {
+                                    sender: Arc::new(Mutex::new(send)),
+                                };
+                                let mut state_lock = chat_state_clone.lock().await;
+                                *state_lock = Some(session);
+                            }
+                        }
                     }
                 }
-                Err(e) => {
-                    eprintln!("Error receiving message: {:?}", e);
-                    // Sleep briefly before retrying.
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        });
+
+        Ok(ticket)
+    }
+
+    /// Join an existing chat room using the provided NodeTicket string.
+    /// The function connects to the remote endpoint, sends the handshake,
+    /// and spawns a task to forward incoming messages as Tauri events.
+    pub async fn join_chat_room(
+        app_handle: tauri::AppHandle,
+        ticket_str: String,
+        chat_state: tauri::State<'_, super::ChatState>,
+    ) -> Result<()> {
+        let ticket = NodeTicket::from_str(&ticket_str)?;
+        let secret_key = get_or_create_secret().await?;
+        let builder = Endpoint::builder()
+            .secret_key(secret_key)
+            .alpns(vec![ALPN.to_vec()]);
+        let endpoint = builder.bind().await?;
+        let addr = ticket.node_addr();
+        let connection = endpoint.connect(addr.clone(), &ALPN.to_vec()).await?;
+        let (mut send, mut recv) = connection.open_bi().await?;
+        // Send the handshake.
+        send.write_all(&HANDSHAKE).await?;
+        // Spawn a task to listen for incoming messages.
+        let app_handle_clone = app_handle.clone();
+        tokio::spawn(async move {
+            let mut buffer = vec![0u8; 1024];
+            loop {
+                match recv.read(&mut buffer).await {
+                    Ok(Some(n)) if n == 0 => break,
+                    Ok(Some(n)) => {
+                        let message = String::from_utf8_lossy(&buffer[..n]).to_string();
+                        let _ = app_handle_clone.emit("new-message", message);
+                    }
+                    Ok(None) => break,
+                    Err(_) => break,
                 }
             }
+        });
+        let session = ChatSession {
+            sender: Arc::new(Mutex::new(send)),
+        };
+        let mut state_lock = chat_state.0.lock().await;
+        *state_lock = Some(session);
+        Ok(())
+    }
+
+    /// Send a message over the active chat session.
+    pub async fn send_message(
+        chat_state: tauri::State<'_, super::ChatState>,
+        message: String,
+    ) -> Result<()> {
+        let state_lock = chat_state.0.lock().await;
+        if let Some(ref session) = *state_lock {
+            let mut sender = session.sender.lock().await;
+            sender.write_all(message.as_bytes()).await?;
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!("No active chat session"))
         }
-    });
-
-    Ok(current_node_id)
-}
-
-#[tauri::command]
-async fn send_msg(msg: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
-    let chat_lock = state.chat.lock().await;
-    if let Some(chat) = &*chat_lock {
-        chat.send(&msg).await.map_err(|e| e.to_string())
-    } else {
-        Err("Chat not started".to_string())
     }
-}
-
-/// (Optional) A command to receive a single message.
-/// With the background listener in place, this might not be needed.
-#[tauri::command]
-async fn receive_msg(state: tauri::State<'_, AppState>) -> Result<String, String> {
-    let chat_lock = state.chat.lock().await;
-    if let Some(chat) = &*chat_lock {
-        chat.receive().await.map_err(|e| e.to_string())
-    } else {
-        Err("Chat not started".to_string())
-    }
-}
-
-/// The greet command remains unchanged.
-#[tauri::command]
-fn greet(name: &str) -> String {
-    format!("Hello, {}! You've been greeted from Rust!", name)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .manage(AppState::new())
+        .manage(ChatState::default())
         .invoke_handler(tauri::generate_handler![
-            start_chat,
-            send_msg,
-            receive_msg,
-            greet
+            create_chat_room,
+            join_chat_room,
+            send_message
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -2,6 +2,7 @@
   "version": "4",
   "specifiers": {
     "npm:@tauri-apps/api@2": "2.2.0",
+    "npm:@tauri-apps/api@^2.2.0": "2.2.0",
     "npm:@tauri-apps/cli@2": "2.2.7",
     "npm:@tauri-apps/plugin-opener@2": "2.2.5",
     "npm:@types/react-dom@^18.3.1": "18.3.5_@types+react@18.3.18",
@@ -614,7 +615,7 @@
   "workspace": {
     "packageJson": {
       "dependencies": [
-        "npm:@tauri-apps/api@2",
+        "npm:@tauri-apps/api@^2.2.0",
         "npm:@tauri-apps/cli@2",
         "npm:@tauri-apps/plugin-opener@2",
         "npm:@types/react-dom@^18.3.1",
