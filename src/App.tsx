@@ -1,145 +1,150 @@
-import { useState } from "react";
+// App.tsx
+import { useEffect, useState } from "react";
 import reactLogo from "./assets/react.svg";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import "./App.css";
-import { Msg } from './types/msg'
-
+import { Msg } from "./types/msg";
 
 function App() {
   const [greetMsg, setGreetMsg] = useState("");
   const [name, setName] = useState("");
-  const [ticket, setTicket] = useState("");
+  // local node id for the chat room (returned when creating a new room)
+  const [nodeId, setNodeId] = useState("");
+  // input for joining an existing room (node id string)
+  const [joinRoomId, setJoinRoomId] = useState("");
+  // message to send
+  const [sendMessage, setSendMessage] = useState("");
+  // latest received message
+  const [receivedMsg, setReceivedMsg] = useState("");
 
-  const [msgs, add_to_msgs] = useState([]);
-  
-
-  const [join_room, update_join_room] = useState("");
-  const [s_msg, update_snd_msg] = useState("");
-  const [r_msg, update_rcv_msg] = useState("");
-
-  async function create_room() {
-    update_room("test")
-    update_room(await invoke("create_room", { room: room }));
+  /**
+   * Start chat by invoking the `start_chat` Tauri command.
+   * If a node id is provided, it will join that chat room.
+   * If not, it creates a new chat room and returns your local node id.
+   */
+  async function startChat(nodeIdParam?: string) {
+    try {
+      // Pass null if undefined so that Rust knows it's a new chat
+      const result = await invoke<string>("start_chat", {
+        nodeid: nodeIdParam || null,
+      });
+      setNodeId(result);
+      console.log("Chat started with node id:", result);
+    } catch (error) {
+      console.error("Error starting chat:", error);
+    }
   }
 
-  async function createRoom() {
-    console.log("create list");
-    invoke('new_room').then(() => {
-      console.log("in new_room and then");
-       getMsgs(); 
-
-     invoke<string>('get_ticket').then((res) => {
-      console.log("fn: get ticket");
-      console.log(res);
-      setTicket(res)
-    })
-
-       //setShowOpenList(false);
-    })
+  /**
+   * Send a message using the active chat.
+   */
+  async function handleSendMessage() {
+    try {
+      await invoke("send_msg", { msg: sendMessage });
+      setSendMessage("");
+    } catch (error) {
+      console.error("Error sending message:", error);
+    }
   }
 
-  const addMsg = async () => {
-    const id = crypto.randomUUID()
-    invoke('new_msg', { msg: { "id": id, "label": s_msg, is_delete: false, created: 0 } })
-    getMsgs()
-  }
+  /**
+   * Listen for incoming messages from the background listener.
+   * When a new message is received via the Tauri event "new_message",
+   * update the UI.
+   */
+  useEffect(() => {
+    const unlisten = listen<string>("new_message", (event) => {
+      console.log("New message received:", event.payload);
+      setReceivedMsg(event.payload);
+    });
+    return () => {
+      unlisten.then((f) => f());
+    };
+  }, []);
 
-
-  async function joinRoom() {
-    console.log("join room");
-    invoke<Todo[]>('set_ticket', { "ticket": join_room }).then((res) => {
-      getMsgs()
-    })
-
-    getMsgs();
-    //setShowOpenList(false);
-  }
- 
-  async function getMsgs() {
-    invoke<Todo[]>('get_msgs').then((res) => {
-      console.log("fn: get msgs")
-      console.log(res)
-      //setAllTodos(res)
-    })
-  }
-
-
-  async function send_msg() {
-    update_rcv_msg(await invoke("send_msg", { sMsg: s_msg }));
-  }
-
+  /**
+   * Greet command remains the same.
+   */
   async function greet() {
-    // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-    setGreetMsg(await invoke("greet", { name }));
+    try {
+      const response = await invoke<string>("greet", { name });
+      setGreetMsg(response);
+    } catch (error) {
+      console.error("Error greeting:", error);
+    }
   }
 
   return (
     <main className="container">
-
-    <button
-        onClick={(e) => {
-          e.preventDefault();
-          createRoom();
-          console.log("create room")
-        }}
-      >Create Room</button>
-    <p id="crt_rm">{ticket}</p>
-    <input type="text" id="join"
-          onChange={(e) => {
-            update_join_room(e.currentTarget.value)
-            console.log("input: join room")
+      <h1>Tauri Chat App</h1>
+      <div>
+        <button
+          onClick={(e) => {
+            e.preventDefault();
+            // Create a new chat room (no node id provided)
+            startChat();
           }}
-       placeholder="Join"></input>
-    <button
-        onClick={(e) => {
-          e.preventDefault();
-          joinRoom();
-          console.log("button: join room")
-        }}
-      >Join Room</button>
-    <input type="text" id="snd_mdg"
-      onChange={(e) => update_snd_msg(e.currentTarget.value)}
-      placeholder="Send Message"></input>
-    <button
-        onClick={(e) => {
-          e.preventDefault();
-          addMsg();
-          send_msg();
-        }}
-      >Send Message</button>
-    <p id="rcv_mdg">{r_msg}</p>
-
-      
-      <h1>Welcome to Tauri + React</h1>
-
-      <div className="row">
-        <a href="https://vitejs.dev" target="_blank">
-          <img src="/vite.svg" className="logo vite" alt="Vite logo" />
-        </a>
-        <a href="https://tauri.app" target="_blank">
-          <img src="/tauri.svg" className="logo tauri" alt="Tauri logo" />
-        </a>
-        <a href="https://reactjs.org" target="_blank">
-          <img src={reactLogo} className="logo react" alt="React logo" />
-        </a>
+        >
+          Create New Chat Room
+        </button>
+        <p>Your Node ID: {nodeId}</p>
       </div>
-      <p>Click on the Tauri, Vite, and React logos to learn more.</p>
-
-      <form
-        className="row"
-        onSubmit={(e) => {
-          e.preventDefault();
-          greet();
-        }}
-      >
+      <div>
         <input
-          id="greet-input"
-          onChange={(e) => setName(e.currentTarget.value)}
-          placeholder="Enter a name..."
+          type="text"
+          placeholder="Join Room (Node ID)"
+          value={joinRoomId}
+          onChange={(e) => setJoinRoomId(e.target.value)}
         />
-        <button type="submit">Greet</button>
-      </form>
-      <p>{greetMsg}</p>
+        <button
+          onClick={(e) => {
+            e.preventDefault();
+            // Join an existing chat room using the provided node id
+            startChat(joinRoomId);
+          }}
+        >
+          Join Existing Chat Room
+        </button>
+      </div>
+      <div>
+        <input
+          type="text"
+          placeholder="Type your message..."
+          value={sendMessage}
+          onChange={(e) => setSendMessage(e.target.value)}
+        />
+        <button
+          onClick={(e) => {
+            e.preventDefault();
+            handleSendMessage();
+          }}
+        >
+          Send Message
+        </button>
+      </div>
+      <div>
+        <p>Received Message: {receivedMsg}</p>
+      </div>
+      <hr />
+      <div>
+        <form
+          className="row"
+          onSubmit={(e) => {
+            e.preventDefault();
+            greet();
+          }}
+        >
+          <input
+            id="greet-input"
+            placeholder="Enter a name..."
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+          />
+          <button type="submit">Greet</button>
+        </form>
+        <p>{greetMsg}</p>
+      </div>
     </main>
   );
 }

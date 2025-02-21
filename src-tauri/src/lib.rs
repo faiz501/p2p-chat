@@ -3,181 +3,110 @@ mod iroh;
 mod messages;
 
 use anyhow::Result;
-use futures_lite::StreamExt;
-use iroh_docs::{rpc::client::docs::LiveEvent, ContentStatus};
+use messages::Chat;
+use std::sync::Arc;
 use tauri::Emitter;
 use tauri::Manager;
 use tokio::sync::Mutex;
 
-use self::{
-    iroh::Iroh,
-    messages::{Msg, Msgs},
-};
+/// Application state holds the chat instance.
+struct AppState {
+    chat: Mutex<Option<Arc<Chat>>>,
+}
 
+impl AppState {
+    fn new() -> Self {
+        AppState {
+            chat: Mutex::new(None),
+        }
+    }
+}
+
+/// Start a chat session.
+/// If a nodeid is provided, join that room; if not, create a new chat room.
+/// The command returns the current node id (which is our local node id when creating a new room,
+/// or the remote node id if joining an existing room).
+#[tauri::command]
+async fn start_chat(
+    app_handle: tauri::AppHandle,
+    nodeid: Option<String>,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    // Create the chat instance (using the nodeid if provided)
+    let chat = Chat::new(nodeid).await.map_err(|e| e.to_string())?;
+    // Extract the node id as a string
+    let current_node_id = chat
+        .nodeid
+        .as_ref()
+        .expect("nodeid should be set")
+        .to_string();
+    let chat = Arc::new(chat);
+    {
+        let mut chat_lock = state.chat.lock().await;
+        *chat_lock = Some(chat.clone());
+    }
+
+    // Spawn an async task that continuously listens for incoming messages.
+    let app_handle_clone = app_handle.clone();
+    tokio::spawn(async move {
+        loop {
+            match chat.receive().await {
+                Ok(msg) => {
+                    // Emit the new message to the frontend (use event "new_message")
+                    if let Err(e) = app_handle_clone.emit("new_message", msg) {
+                        eprintln!("Error emitting new_message event: {:?}", e);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error receiving message: {:?}", e);
+                    // Sleep briefly before retrying.
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
+            }
+        }
+    });
+
+    Ok(current_node_id)
+}
+
+#[tauri::command]
+async fn send_msg(msg: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let chat_lock = state.chat.lock().await;
+    if let Some(chat) = &*chat_lock {
+        chat.send(&msg).await.map_err(|e| e.to_string())
+    } else {
+        Err("Chat not started".to_string())
+    }
+}
+
+/// (Optional) A command to receive a single message.
+/// With the background listener in place, this might not be needed.
+#[tauri::command]
+async fn receive_msg(state: tauri::State<'_, AppState>) -> Result<String, String> {
+    let chat_lock = state.chat.lock().await;
+    if let Some(chat) = &*chat_lock {
+        chat.receive().await.map_err(|e| e.to_string())
+    } else {
+        Err("Chat not started".to_string())
+    }
+}
+
+/// The greet command remains unchanged.
 #[tauri::command]
 fn greet(name: &str) -> String {
     format!("Hello, {}! You've been greeted from Rust!", name)
 }
 
-async fn setup<R: tauri::Runtime>(handle: tauri::AppHandle<R>) -> Result<()> {
-    // Get the application data directory and append "iroh_data"
-    let data_root = handle.path().app_data_dir().unwrap().join("iroh_data");
-
-    // Initialize the Iroh node using the data root
-    let iroh = Iroh::new(data_root).await?;
-    handle.manage(AppState::new(iroh));
-
-    Ok(())
-}
-
-struct AppState {
-    msgs: Mutex<Option<(Msgs, tokio::task::JoinHandle<()>)>>,
-    iroh: Iroh,
-}
-
-impl AppState {
-    fn new(iroh: Iroh) -> Self {
-        AppState {
-            msgs: Mutex::new(None),
-            iroh,
-        }
-    }
-
-    fn iroh(&self) -> &Iroh {
-        &self.iroh
-    }
-
-    async fn init_todos<R: tauri::Runtime>(
-        &self,
-        app_handle: tauri::AppHandle<R>,
-        msgs: Msgs,
-    ) -> Result<()> {
-        let mut events = msgs.doc_subscribe().await?;
-        let events_handle = tokio::spawn(async move {
-            while let Some(Ok(event)) = events.next().await {
-                match event {
-                    LiveEvent::InsertRemote { content_status, .. } => {
-                        // Only update if we already have the content.
-                        if content_status == ContentStatus::Complete {
-                            app_handle.emit("update-all", ()).ok();
-                        }
-                    }
-                    LiveEvent::InsertLocal { .. } | LiveEvent::ContentReady { .. } => {
-                        app_handle.emit("update-all", ()).ok();
-                    }
-                    _ => {}
-                }
-            }
-        });
-
-        let mut t = self.msgs.lock().await;
-        if let Some((_msgs, handle)) = t.take() {
-            handle.abort();
-        }
-        *t = Some((msgs, events_handle));
-
-        Ok(())
-    }
-}
-
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .plugin(tauri_plugin_opener::init())
-        .setup(|app| {
-            // Clone the app handle so that it becomes 'static for the async task.
-            let app_handle = app.handle().clone();
-            tauri::async_runtime::spawn(async move {
-                println!("starting backend...");
-                if let Err(err) = setup(app_handle).await {
-                    eprintln!("failed: {:?}", err);
-                }
-            });
-            Ok(())
-        })
+        .manage(AppState::new())
         .invoke_handler(tauri::generate_handler![
-            greet,
-            create_room,
+            start_chat,
             send_msg,
-            set_ticket,
-            get_ticket,
-            get_msgs,
-            new_room,
-            new_msg,
+            receive_msg,
+            greet
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
-}
-
-#[tauri::command]
-async fn get_msgs(state: tauri::State<'_, AppState>) -> Result<Vec<Msg>, String> {
-    if let Some((msgs, _)) = &mut *state.msgs.lock().await {
-        let msgs = msgs.get_msgs().await.map_err(|e| e.to_string())?;
-        return Ok(msgs);
-    }
-    Err("not initialized".to_string())
-}
-
-#[tauri::command]
-async fn new_room(
-    app_handle: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
-) -> Result<(), String> {
-    let todos = Msgs::new(None, state.iroh().clone())
-        .await
-        .map_err(|e| e.to_string())?;
-    println!("Created new todos: {:#?}", todos);
-    state
-        .init_todos(app_handle, todos)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    Ok(())
-}
-
-#[tauri::command]
-async fn new_msg(msg: Msg, state: tauri::State<'_, AppState>) -> Result<(), String> {
-    if let Some((msgs, _)) = &mut *state.msgs.lock().await {
-        msgs.add(msg.id, msg.label)
-            .await
-            .map_err(|e| e.to_string())?;
-        return Ok(());
-    }
-    Err("not initialized".to_string())
-}
-
-#[tauri::command]
-async fn set_ticket(
-    app_handle: tauri::AppHandle,
-    ticket: String,
-    state: tauri::State<'_, AppState>,
-) -> Result<(), String> {
-    let todos = Msgs::new(Some(ticket), state.iroh().clone())
-        .await
-        .map_err(|e| e.to_string())?;
-
-    state
-        .init_todos(app_handle, todos)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    Ok(())
-}
-
-#[tauri::command]
-async fn get_ticket(state: tauri::State<'_, AppState>) -> Result<String, String> {
-    if let Some((todos, _)) = &mut *state.msgs.lock().await {
-        return Ok(todos.ticket());
-    }
-    Err("not initialized".to_string())
-}
-
-#[tauri::command]
-fn create_room(room: &str) -> String {
-    format!("Creating a room.. {}", room)
-}
-
-#[tauri::command]
-fn send_msg(s_msg: &str) -> String {
-    format!("Sending msg: {}", s_msg)
 }

@@ -1,73 +1,100 @@
-use std::{path::PathBuf, sync::Arc};
-
-use anyhow::Result;
-use iroh::protocol::Router;
-use quic_rpc::transport::flume::FlumeConnector;
-
-pub(crate) type BlobsClient = iroh_blobs::rpc::client::blobs::Client<
-    FlumeConnector<iroh_blobs::rpc::proto::Response, iroh_blobs::rpc::proto::Request>,
->;
-pub(crate) type DocsClient = iroh_docs::rpc::client::docs::Client<
-    FlumeConnector<iroh_docs::rpc::proto::Response, iroh_docs::rpc::proto::Request>,
->;
+use anyhow::{Context, Result};
+use iroh::{endpoint::Connection, Endpoint, NodeId};
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 #[derive(Clone, Debug)]
-pub(crate) struct Iroh {
-    #[allow(dead_code)]
-    router: Router,
-    pub(crate) blobs: BlobsClient,
-    pub(crate) docs: DocsClient,
+pub struct Iroh {
+    pub endpoint: Endpoint,
+    pub connections: Arc<Mutex<HashMap<NodeId, Connection>>>,
 }
 
 impl Iroh {
-    pub async fn new(path: PathBuf) -> Result<Self> {
-        // create dir if it doesn't already exist
-        tokio::fs::create_dir_all(&path).await?;
-
-        let key = iroh_blobs::util::fs::load_secret_key(path.clone().join("keypair")).await?;
-
-        // create endpoint
-        let endpoint = iroh::Endpoint::builder()
-            .discovery_n0()
-            .secret_key(key)
+    pub async fn new() -> Result<Self> {
+        let endpoint = Endpoint::builder()
+            .alpns(vec![b"hello-world".to_vec()])
             .bind()
-            .await?;
+            .await
+            .context("Failed to bind endpoint")?;
 
-        // build the protocol router
-        let mut builder = iroh::protocol::Router::builder(endpoint);
-
-        // add iroh gossip
-        let gossip = iroh_gossip::net::Gossip::builder()
-            .spawn(builder.endpoint().clone())
-            .await?;
-        builder = builder.accept(iroh_gossip::ALPN, Arc::new(gossip.clone()));
-
-        // add iroh blobs
-        let blobs = iroh_blobs::net_protocol::Blobs::persistent(&path)
-            .await?
-            .build(builder.endpoint());
-        builder = builder.accept(iroh_blobs::ALPN, blobs.clone());
-
-        // add docs
-        let docs = iroh_docs::protocol::Docs::persistent(path)
-            .spawn(&blobs, &gossip)
-            .await?;
-        builder = builder.accept(iroh_docs::ALPN, Arc::new(docs.clone()));
-
-        let router = builder.spawn().await?;
-
-        let blobs_client = blobs.client().clone();
-        let docs_client = docs.client().clone();
-
-        Ok(Self {
-            router,
-            blobs: blobs_client,
-            docs: docs_client,
+        Ok(Iroh {
+            endpoint,
+            connections: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
-    #[allow(dead_code)]
-    pub(crate) async fn shutdown(self) -> Result<()> {
-        self.router.shutdown().await
+    /// Returns the local NodeId for this endpoint.
+    pub fn local_node_id(&self) -> NodeId {
+        // Assumes the underlying endpoint provides a method to retrieve the local node id.
+        self.endpoint.node_id()
+    }
+
+    pub async fn connect(&self, node_id: NodeId) -> Result<()> {
+        let connection = self
+            .endpoint
+            .connect(node_id, b"hello-world")
+            .await
+            .context("Failed to connect to peer")?;
+
+        self.connections.lock().await.insert(node_id, connection);
+
+        Ok(())
+    }
+
+    pub async fn send_msg(&self, node_id: &NodeId, msg: &str) -> Result<()> {
+        let connections = self.connections.lock().await;
+        let connection = connections.get(node_id).context("Connection not found")?;
+
+        let mut send_stream = connection
+            .open_uni()
+            .await
+            .context("Failed to open unidirectional stream")?;
+
+        send_stream
+            .write_all(msg.as_bytes())
+            .await
+            .context("Failed to send message")?;
+
+        send_stream.finish().context("Failed to finish stream")?;
+
+        Ok(())
+    }
+
+    pub async fn accept_msg(&self) -> Result<(NodeId, String)> {
+        let connection = self
+            .endpoint
+            .accept()
+            .await
+            .context("No incoming connection")?
+            .await
+            .context("Failed to accept connection")?;
+
+        let peer_id = connection
+            .remote_node_id()
+            .context("Could not find peer node id")?;
+        self.connections
+            .lock()
+            .await
+            .insert(peer_id, connection.clone());
+
+        let mut recv_stream = connection
+            .accept_uni()
+            .await
+            .context("Failed to accept unidirectional stream")?;
+
+        let mut buf = Vec::new();
+        recv_stream
+            .read(&mut buf)
+            .await
+            .context("Failed to read message")?;
+        let msg = String::from_utf8(buf).context("Invalid UTF-8 message")?;
+
+        Ok((peer_id, msg))
+    }
+
+    pub async fn shutdown(&self) -> Result<()> {
+        self.endpoint.close().await;
+        Ok(())
     }
 }
