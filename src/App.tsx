@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
+import "./App.css";
 
 const App: React.FC = () => {
   const [ticket, setTicket] = useState<string>('');
@@ -50,10 +51,10 @@ const App: React.FC = () => {
 
   return (
     <div style={{ margin: '2rem' }}>
-      <h1>Tauri P2P Chat App</h1>
+      <h2>P2P Chat</h2>
 
       <section>
-        <h2>Create Chat Room</h2>
+        <h3>Create Chat Room</h3>
         <button onClick={createRoom}>Create Room</button>
         {ticket && (
           <p>
@@ -63,7 +64,7 @@ const App: React.FC = () => {
       </section>
 
       <section>
-        <h2>Join Chat Room</h2>
+        <h3>Join Chat Room</h3>
         <input
           type="text"
           value={joinTicket}
@@ -75,7 +76,7 @@ const App: React.FC = () => {
 
       <section>
         <h2>Chat</h2>
-        <div style={{ border: '1px solid #ccc', padding: '1rem', height: '200px', overflowY: 'scroll' }}>
+        <div style={{ border: '1px solid #ccc', padding: '1rem', height: '160px', overflowY: 'scroll' }}>
           {chatLog.map((msg, idx) => (
             <p key={idx}>{msg}</p>
           ))}
