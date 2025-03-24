@@ -40,5 +40,5 @@ The app is based around idea of virtual rooms. All the people in a room can talk
 ### Guidelines
 
 It is advised to never share the rooom ticket over unsafe communication channels.
-Ideally it is shared in person only to maintain privacy.
-The room can persist even after network changes but if a person leaves the room, the chats history is lost.
+Ideally it is shared in person only, to maintain privacy.
+The room can persist even after network changes.
