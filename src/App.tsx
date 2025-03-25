@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
-import { invoke } from '@tauri-apps/api/core';
+import { invoke } from '@tauri-apps/api';
 import { listen } from '@tauri-apps/api/event';
+import { QRCode } from 'react-qr-code';
 import "./App.css";
 
 const App: React.FC = () => {
@@ -9,21 +10,17 @@ const App: React.FC = () => {
   const [message, setMessage] = useState<string>('');
   const [chatLog, setChatLog] = useState<string[]>([]);
 
-  // Listen for incoming messages from the backend.
-  useEffect(() => {
-    const unlistenPromise = listen<string>('new-message', (event) => {
-      setChatLog((prev) => [...prev, event.payload]);
-    });
-    return () => {
-      unlistenPromise.then((unlisten) => unlisten());
-    };
-  }, []);
+  // Generate cryptographic key in Rust backend
+  const generateCryptoKey = async (): Promise<string> => {
+    return await invoke('generate_crypto_key');
+  };
 
-  // Create a new chat room.
+  // Modified createRoom with crypto key generation
   const createRoom = async () => {
     try {
-      const result: string = await invoke('create_chat_room');
-      setTicket(result);
+      const cryptoKey = await generateCryptoKey();
+      const result: string = await invoke('create_chat_room', { cryptoKey });
+      setTicket(cryptoKey); // Store the cryptographic key as ticket
     } catch (err) {
       console.error('Error creating room:', err);
     }
@@ -57,38 +54,41 @@ const App: React.FC = () => {
         <h3>Create Chat Room</h3>
         <button onClick={createRoom}>Create Room</button>
         {ticket && (
-          <p>
-            Your room ticket: <code>{ticket}</code>
-          </p>
+          <div>
+            <p>Your secure room key:</p>
+            <code>{ticket}</code>
+            <div style={{ margin: '1rem 0' }}>
+              <QRCode
+                value={ticket}
+                size={128}
+                level="H" // High error correction
+                includeMargin={true}
+              />
+            </div>
+          </div>
         )}
       </section>
 
       <section>
         <h3>Join Chat Room</h3>
-        <input
-          type="text"
-          value={joinTicket}
-          onChange={(e) => setJoinTicket(e.target.value)}
-          placeholder="Enter room ticket"
-        />
-        <button onClick={joinRoom}>Join Room</button>
+        <div style={{ display: 'flex', gap: '0.5rem' }}>
+          <input
+            type="text"
+            value={joinTicket}
+            onChange={(e) => setJoinTicket(e.target.value)}
+            placeholder="Enter room key or scan QR"
+          />
+          <button onClick={joinRoom}>Join Room</button>
+        </div>
       </section>
 
-      <section>
-        <h2>Chat</h2>
-        <div style={{ border: '1px solid #ccc', padding: '1rem', height: '160px', overflowY: 'scroll' }}>
-          {chatLog.map((msg, idx) => (
-            <p key={idx}>{msg}</p>
-          ))}
-        </div>
-        <input
-          type="text"
-          value={message}
-          onChange={(e) => setMessage(e.target.value)}
-          placeholder="Type your message"
-          style={{ width: '70%' }}
-        />
-        <button onClick={sendMsg}>Send</button>
+      <section> 
+        <h2>Chat</h2> 
+        <div style={{ border: '1px solid #ccc', padding: '1rem', height: '160px', overflowY: 'scroll' }}> 
+          {chatLog.map((msg, idx) => (<p key={idx}>{msg}</p>))} 
+        </div> 
+        <input type="text" value={message} onChange={(e) => setMessage(e.target.value)} placeholder="Type your message" style={{ width: '70%' }} /> 
+        <button onClick={sendMsg}>Send</button> 
       </section>
     </div>
   );
