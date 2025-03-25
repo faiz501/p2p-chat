@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
-import { invoke } from '@tauri-apps/api';
+import { core } from '@tauri-apps/api';
 import { listen } from '@tauri-apps/api/event';
-import { QRCode } from 'react-qr-code';
+import { QRCodeSVG } from 'qrcode.react';
 import "./App.css";
 
 const App: React.FC = () => {
@@ -12,14 +12,14 @@ const App: React.FC = () => {
 
   // Generate cryptographic key in Rust backend
   const generateCryptoKey = async (): Promise<string> => {
-    return await invoke('generate_crypto_key');
+    return await core.invoke('generate_crypto_key');
   };
 
   // Modified createRoom with crypto key generation
   const createRoom = async () => {
     try {
       const cryptoKey = await generateCryptoKey();
-      const result: string = await invoke('create_chat_room', { cryptoKey });
+      const result = await core.invoke('create_chat_room', { cryptoKey });
       setTicket(cryptoKey); // Store the cryptographic key as ticket
     } catch (err) {
       console.error('Error creating room:', err);
@@ -29,7 +29,7 @@ const App: React.FC = () => {
   // Join an existing chat room using the provided ticket.
   const joinRoom = async () => {
     try {
-      await invoke('join_chat_room', { ticket: joinTicket });
+      await core.invoke('join_chat_room', { ticket: joinTicket });
     } catch (err) {
       console.error('Error joining room:', err);
     }
@@ -38,7 +38,7 @@ const App: React.FC = () => {
   // Send a message on the active chat session.
   const sendMsg = async () => {
     try {
-      await invoke('send_message', { message });
+      await core.invoke('send_message', { message });
       setChatLog((prev) => [...prev, `Me: ${message}`]);
       setMessage('');
     } catch (err) {
@@ -58,12 +58,12 @@ const App: React.FC = () => {
             <p>Your secure room key:</p>
             <code>{ticket}</code>
             <div style={{ margin: '1rem 0' }}>
-              <QRCode
+            <QRCodeSVG
                 value={ticket}
                 size={128}
-                level="H" // High error correction
+                level="H"
                 includeMargin={true}
-              />
+            />
             </div>
           </div>
         )}
